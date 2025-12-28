@@ -86,11 +86,8 @@ impl Task {
     }
 
     /// Updates the task's context.
-    ///
-    /// # Safety
-    /// The caller must guarantee that the provided context is save to use.
-    pub unsafe fn update(&mut self, new: NonNull<CpuState>) {
-        self.context = new;
+    pub fn update(&mut self, new: &CpuState) {
+        self.context = NonNull::from_ref(new);
     }
 }
 

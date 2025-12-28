@@ -51,6 +51,7 @@ fn dispatch(state: &CpuState) -> &CpuState {
             // SAFETY: hardware interrupts are disabled until after the handler is called.
             lapic::eoi()
                 .expect("LAPIC must have been initialized before enabling hardware interrupts!");
+            serial_println!("AAAA");
             return <scheduling::PerCoreScheduler as Scheduler>::run(state);
         }
 

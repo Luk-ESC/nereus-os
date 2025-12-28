@@ -1,10 +1,11 @@
 use core::{arch::asm, ptr::NonNull};
 
 use crate::{
-    PhysicalAddress, VirtualAddress, bitmap_allocator::BitMapAllocator, error::FrameAllocatorError,
+    bitmap_allocator::BitMapAllocator, error::FrameAllocatorError, paging::PageEntry,
+    PhysicalAddress, VirtualAddress,
 };
 
-use super::{PageEntryFlags, PageTable, index::PageMapIndexer};
+use super::{index::PageMapIndexer, PageEntryFlags, PageTable};
 
 /// Manages Page Table Mappings
 #[derive(Debug)]
@@ -370,4 +371,59 @@ impl PageTableMappings {
             Ok(unsafe { NonNull::new_unchecked(new_table) })
         }
     }
+
+    /// Walks all present mappings and calls `log` for each mapping and log2 for each page table entry.
+    pub fn dump_mappings<F, G>(&self, mut log: F, mut log2: G)
+    where
+        F: FnMut(VirtualAddress, PhysicalAddress),
+        G: FnMut(usize, &PageEntry),
+    {
+        let pml4 = unsafe { self.pml4_virtual().as_ref() };
+        let offset = self.offset();
+
+        for (pml4_i, pml4e) in pml4.entries.iter().enumerate() {
+            log2(pml4_i, pml4e);
+            if !pml4e.flags().contains(PageEntryFlags::PRESENT) {
+                continue;
+            }
+
+            let pdp = unsafe { &*((pml4e.address() + offset) as *const PageTable) };
+
+            for (pdp_i, pdpe) in pdp.entries.iter().enumerate() {
+                if !pdpe.flags().contains(PageEntryFlags::PRESENT) {
+                    continue;
+                }
+
+                let pd = unsafe { &*((pdpe.address() + offset) as *const PageTable) };
+
+                for (pd_i, pde) in pd.entries.iter().enumerate() {
+                    if !pde.flags().contains(PageEntryFlags::PRESENT) {
+                        continue;
+                    }
+
+                    let pt = unsafe { &*((pde.address() + offset) as *const PageTable) };
+
+                    for (pt_i, pte) in pt.entries.iter().enumerate() {
+                        if !pte.flags().contains(PageEntryFlags::PRESENT) {
+                            continue;
+                        }
+
+                        let virt = make_virt(pml4_i as u64, pdp_i as u64, pd_i as u64, pt_i as u64);
+
+                        let phys = pte.address();
+
+                        log(virt, phys);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[inline]
+fn make_virt(pml4: u64, pdp: u64, pd: u64, pt: u64) -> VirtualAddress {
+    let addr = (pml4 << 39) | (pdp << 30) | (pd << 21) | (pt << 12);
+
+    // sign extend bit 47
+    ((addr << 16) as i64 >> 16) as VirtualAddress
 }

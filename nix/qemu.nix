@@ -21,7 +21,7 @@ pkgs.writeShellApplication {
     -drive if=pflash,format=raw,readonly=on,file="$OVMF"/OVMF_CODE.fd \
     -drive if=pflash,format=raw,readonly=on,file="$OVMF"/OVMF_VARS.fd \
     -drive format=raw,file="$IMG" \
-    -serial stdio \
+    -serial file:stdio.log \
     -d int \
     -D qemu.log \
     -no-reboot \

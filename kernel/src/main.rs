@@ -119,7 +119,8 @@ pub extern "sysv64" fn _start(bootinfo: &mut BootInfo) -> ! {
     validate!(result lapict::initialize(), "Initializing LAPIC timer");
     loginfo!("LAPIC timer is callibrated to PIT frequency");
 
-    // validate!(result scheduling::initialize(), "Initializing multitasking");
+    // execution continues as the init task
+    validate!(result scheduling::initialize(), "Initializing multitasking");
 
     hal::hlt_loop();
 }

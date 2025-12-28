@@ -1,32 +1,58 @@
-use alloc::{collections::linked_list::LinkedList, rc::Rc};
-use core::{cell::RefCell, ptr::NonNull};
+use alloc::collections::vec_deque::VecDeque;
+use core::ptr::NonNull;
 use error::SchedulerError;
-use hal::{cpu_state::CpuState, hlt_loop};
+use framebuffer::color;
+use hal::cpu_state::CpuState;
 use mem::{paging::PageTable, VirtualAddress, PAGE_SIZE};
-use scheduler::{memory::AddressSpace, task::Task, Scheduler};
+use scheduler::{
+    memory::AddressSpace,
+    task::{Task, TaskState},
+    Scheduler,
+};
 use sync::locked::Locked;
 
 use crate::{
     gdt::{KERNEL_CS, KERNEL_DS},
-    serial_println,
+    loginfo,
+    memory::vmm,
+    print,
     vmm::{error::VmmError, object::VmFlags, AllocationType, VMM},
 };
 
 mod error;
 
 pub(crate) fn initialize() -> Result<(), SchedulerError> {
-    SCHEDULER.initialize(PerCoreScheduler::try_new(idle)?);
+    SCHEDULER.initialize(PerCoreScheduler::try_new(init, idle)?);
     Ok(())
 }
 
 fn idle() {
-    serial_println!("now idle");
-    hlt_loop();
+    loginfo!("now idle");
+    loop {
+        print!(color::INFO, "A");
+    }
 }
 
 fn test() {
-    serial_println!("now tst");
-    hlt_loop();
+    loginfo!("now test");
+    loop {
+        print!(color::INFO, "C");
+    }
+}
+
+fn init() {
+    loginfo!("now init");
+
+    // add new process
+    {
+        let mut sched = SCHEDULER.locked();
+        let sched = sched.get_mut().unwrap();
+        sched.insert_process(test).unwrap();
+    }
+
+    loop {
+        print!(color::INFO, "B");
+    }
 }
 
 static SCHEDULER: Locked<PerCoreScheduler> = Locked::new();
@@ -38,28 +64,38 @@ macro_rules! vmm {
 }
 #[derive(Debug)]
 pub(crate) struct PerCoreScheduler {
-    tasks: LinkedList<Rc<RefCell<Task>>>,
-    active: Rc<RefCell<Task>>,
-    idle: Rc<RefCell<Task>>,
+    ready_tasks: VecDeque<Task>,
+    active_pid: u64,
+    idle_pid: u64,
     pid_counter: u64,
 }
 
-fn dump(t: &Task) {
-    let mut locked = VMM.locked();
-    let vmm = locked.get_mut().unwrap();
-    serial_println!("current: {:?}", unsafe {
-        vmm.ptm().mappings_ref().pml4_virtual().as_ref().entries
-    });
-
-    serial_println!("task: {:?}", unsafe {
-        t.mappings().pml4_virtual().as_ref().entries
-    });
-}
-
 impl PerCoreScheduler {
-    /// Initializes a new scheduler with an idle task.
-    pub(crate) fn try_new(_idle: fn()) -> Result<PerCoreScheduler, SchedulerError> {
-        todo!("create new per core scheduler")
+    /// Initializes a new scheduler with an init and an idle task.
+    pub(crate) fn try_new(init: fn(), idle: fn()) -> Result<PerCoreScheduler, SchedulerError> {
+        let idle = PerCoreScheduler::create_process(0, idle)?;
+        let init = PerCoreScheduler::create_process(1, init)?;
+        let idle_pid = idle.pid();
+
+        let ready_tasks = VecDeque::from([idle, init]);
+
+        let active_pid = idle_pid;
+
+        let pid_counter = 2;
+
+        Ok(PerCoreScheduler {
+            ready_tasks,
+            active_pid,
+            idle_pid,
+            pid_counter,
+        })
+    }
+    fn activate_task(task: &mut Task) {
+        task.activate().unwrap();
+        // update VMM
+        unsafe {
+            vmm::update(task.mappings()).unwrap();
+        }
     }
 }
 
@@ -114,6 +150,7 @@ impl Scheduler for PerCoreScheduler {
 
         vmm.alloc(Self::STACK_SIZE, VmFlags::WRITE, AllocationType::AnyPages)
             .map_err(SchedulerError::from)
+            .map(|p| unsafe { p.add(Self::STACK_SIZE) })
     }
     fn free_stack(stack_top: NonNull<u8>) -> Result<(), Self::SchedulerError> {
         let mut locked = VMM.locked();
@@ -123,28 +160,77 @@ impl Scheduler for PerCoreScheduler {
             .map_err(SchedulerError::from)
     }
 
-    /// Removes a process from the queue of tasks. This only succeeds if the process has the state
+    /// Removes the process from the queue of tasks. This only succeeds if the process has the state
     /// [`scheduler::task::TaskState::Done`].
-    fn remove_process(&mut self, _pid: u64) -> Result<Rc<RefCell<Task>>, Self::SchedulerError> {
-        unimplemented!();
+    fn remove_process(&mut self, task_pid: u64) -> Task {
+        let idx = self
+            .ready_tasks
+            .iter()
+            .position(|x| x.pid() == task_pid)
+            .expect("process to be removed must exist");
+
+        let task = self.ready_tasks.remove(idx).unwrap();
+        assert_eq!(task.state(), TaskState::Done);
+        task
     }
 
-    fn add_process(&mut self, _process: Task) -> Result<(), Self::SchedulerError> {
-        unimplemented!();
+    fn add_process(&mut self, process: Task) {
+        assert_eq!(process.state(), TaskState::Ready);
+        assert_eq!(process.pid(), self.pid_counter - 1);
+        self.ready_tasks.push_front(process);
     }
 
     fn run(context: &CpuState) -> &CpuState {
-        /*
-        // set old address space & task to deactived
-        current_task.pause().expect("scheduler paused - failed");
-        let mut next_task = next_task.borrow_mut();
-        next_task.activate().unwrap();
-        // update VMM
-        unsafe {
-            vmm::update(next_task.mappings()).unwrap();
+        let mut scheduler = SCHEDULER.locked();
+        let Some(scheduler) = scheduler.get_mut() else {
+            return context;
+        };
+        // first pause the current task
+        {
+            let current_task_pid = scheduler.active_pid;
+            let current_task = scheduler
+                .ready_tasks
+                .iter_mut()
+                .find(|x| x.pid() == current_task_pid)
+                .expect("active task must be part of task queue.");
+            match current_task.state() {
+                TaskState::Ready => {
+                    // first time a task is scheduled
+                    PerCoreScheduler::activate_task(current_task);
+                    return unsafe { current_task.context().as_ref() };
+                }
+                TaskState::Done => {
+                    assert_ne!(current_task_pid, scheduler.idle_pid);
+                    // remove finsihed task
+                    scheduler.kill_process(current_task_pid).unwrap();
+                }
+                TaskState::Running => {
+                    // set old address space & task to deactived
+                    current_task.pause().expect("scheduler paused - failed");
+                    current_task.update(context); // update state to current one
+                }
+            }
         }
-        return unsafe { next_task.context().as_ref() };
-        */
+        // then activate the next task
+        let mut next_task = scheduler
+            .ready_tasks
+            .pop_back()
+            .expect("at least idle task must be present");
+
+        scheduler.active_pid = next_task.pid();
+        PerCoreScheduler::activate_task(&mut next_task);
+        let context = unsafe { next_task.context().as_ref() };
+        scheduler.ready_tasks.push_front(next_task);
+
         context
+    }
+
+    fn insert_process(&mut self, entry: fn()) -> Result<(), Self::SchedulerError> {
+        let pid = self.pid_counter;
+        self.pid_counter += 1;
+
+        let task = PerCoreScheduler::create_process(pid, entry)?;
+        self.add_process(task);
+        Ok(())
     }
 }

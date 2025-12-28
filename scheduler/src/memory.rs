@@ -1,13 +1,13 @@
 use core::ptr::NonNull;
 
 use mem::{
-    VirtualAddress,
     bitmap_allocator::BitMapAllocator,
     error::FrameAllocatorError,
     paging::{
-        PageTable,
         ptm::{PageTableManager, PageTableMappings},
+        PageTable,
     },
+    VirtualAddress,
 };
 
 /// Owns page memory mappings and keeps track of the process' allocated frames. The higher-half of
@@ -88,8 +88,6 @@ impl AddressSpace {
         let mut cpy = PageTableMappings::new(self.mappings.pml4_physical(), self.mappings.nx());
         unsafe {
             cpy.update_offset(self.mappings.offset());
-        }
-        unsafe {
             cpy.update_pml4_virtual(self.mappings.pml4_virtual());
         }
         cpy
